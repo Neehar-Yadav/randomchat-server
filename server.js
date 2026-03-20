@@ -1,15 +1,7 @@
-// ============================================================
-// FILE: server/server.js
-// PURPOSE: Main signaling server for WebRTC + random matching
-// RUN: node server.js
-// DEPLOY TO: AWS EC2 / Railway / Render
-// ============================================================
-
 const express = require('express')
 const http = require('http')
 const { Server } = require('socket.io')
 const cors = require('cors')
-const mongoose = require('mongoose')
 require('dotenv').config()
 
 const app = express()
@@ -18,204 +10,118 @@ app.use(express.json())
 
 const server = http.createServer(app)
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 })
 
-// ── In-memory waiting pool ─────────────────────────────────
-// Stores users waiting for a match
-// { socketId, socket, gender, interests }
 let waitingPool = []
-
-// Active rooms: roomId → [socketId1, socketId2]
 const activeRooms = new Map()
-
-// User data: socketId → { room, partnerId, reportCount }
 const userSessions = new Map()
 
-// ── Utility ────────────────────────────────────────────────
 const generateRoomId = () =>
   `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
+// Both users must be mutually compatible
+const isCompatible = (userGender, userPref, candidateGender, candidatePref) => {
+  const iWantThem = userPref === 'any' || userPref === candidateGender
+  const theyWantMe = candidatePref === 'any' || candidatePref === userGender
+  return iWantThem && theyWantMe
+}
+
 const findMatch = (socket, filters = {}) => {
-  // Find first compatible waiting user
-  const index = waitingPool.findIndex(
-    (u) => u.socketId !== socket.id
-  )
+  const { gender = 'other', pref = 'any' } = filters
+  const index = waitingPool.findIndex(u => {
+    if (u.socketId === socket.id) return false
+    return isCompatible(gender, pref, u.gender, u.pref)
+  })
   if (index !== -1) {
     const partner = waitingPool[index]
-    waitingPool.splice(index, 1) // remove from pool
+    waitingPool.splice(index, 1)
     return partner
   }
   return null
 }
 
-// ── Socket Events ──────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log(`✅ User connected: ${socket.id}`)
+  console.log(`✅ Connected: ${socket.id}`)
+  userSessions.set(socket.id, { room: null, partnerId: null, reportCount: 0, gender: 'other', pref: 'any' })
 
-  // Initialize session
-  userSessions.set(socket.id, {
-    room: null,
-    partnerId: null,
-    reportCount: 0
-  })
-
-  // ── 1. Find Match ────────────────────────────────────────
   socket.on('find_match', (data = {}) => {
     const session = userSessions.get(socket.id)
-
-    // If already in a room, leave it first
-    if (session.room) {
-      leaveRoom(socket)
-    }
-
-    const partner = findMatch(socket, data)
-
+    const { gender = 'other', pref = 'any' } = data
+    userSessions.set(socket.id, { ...session, gender, pref })
+    if (session.room) leaveRoom(socket)
+    const partner = findMatch(socket, { gender, pref })
     if (partner) {
-      // Match found — create room
       const roomId = generateRoomId()
-
-      // Both join the room
       socket.join(roomId)
       partner.socket.join(roomId)
-
-      // Update sessions
-      userSessions.set(socket.id, {
-        room: roomId,
-        partnerId: partner.socketId,
-        reportCount: session.reportCount
-      })
-      userSessions.set(partner.socketId, {
-        room: roomId,
-        partnerId: socket.id,
-        reportCount: userSessions.get(partner.socketId).reportCount
-      })
-
+      userSessions.set(socket.id, { room: roomId, partnerId: partner.socketId, reportCount: session.reportCount, gender, pref })
+      userSessions.set(partner.socketId, { room: roomId, partnerId: socket.id, reportCount: userSessions.get(partner.socketId)?.reportCount || 0, gender: partner.gender, pref: partner.pref })
       activeRooms.set(roomId, [socket.id, partner.socketId])
-
-      // Notify both users
-      socket.emit('match_found', { roomId, initiator: true })
-      partner.socket.emit('match_found', { roomId, initiator: false })
-
-      console.log(`🎯 Matched: ${socket.id} ↔ ${partner.socketId} in ${roomId}`)
+      socket.emit('match_found', { roomId, initiator: true, partnerGender: partner.gender })
+      partner.socket.emit('match_found', { roomId, initiator: false, partnerGender: gender })
+      console.log(`🎯 Matched: ${socket.id}(${gender},wants:${pref}) <-> ${partner.socketId}(${partner.gender},wants:${partner.pref})`)
     } else {
-      // No match yet — add to waiting pool
-      waitingPool.push({ socketId: socket.id, socket })
+      waitingPool.push({ socketId: socket.id, socket, gender, pref })
       socket.emit('waiting')
-      console.log(`⏳ Waiting: ${socket.id} | Pool size: ${waitingPool.length}`)
+      console.log(`⏳ Waiting: ${socket.id} | gender:${gender} pref:${pref} | pool:${waitingPool.length}`)
     }
   })
 
-  // ── 2. WebRTC Signaling ──────────────────────────────────
-  socket.on('offer', ({ roomId, offer }) => {
-    socket.to(roomId).emit('offer', offer)
-  })
+  socket.on('offer', ({ roomId, offer }) => { socket.to(roomId).emit('offer', offer) })
+  socket.on('answer', ({ roomId, answer }) => { socket.to(roomId).emit('answer', answer) })
+  socket.on('ice_candidate', ({ roomId, candidate }) => { socket.to(roomId).emit('ice_candidate', candidate) })
 
-  socket.on('answer', ({ roomId, answer }) => {
-    socket.to(roomId).emit('answer', answer)
-  })
-
-  socket.on('ice_candidate', ({ roomId, candidate }) => {
-    socket.to(roomId).emit('ice_candidate', candidate)
-  })
-
-  // ── 3. Next / Skip ───────────────────────────────────────
   socket.on('next', () => {
     leaveRoom(socket)
-    // Auto find new match
-    const partner = findMatch(socket)
+    const session = userSessions.get(socket.id)
+    const { gender = 'other', pref = 'any' } = session || {}
+    const partner = findMatch(socket, { gender, pref })
     if (partner) {
       const roomId = generateRoomId()
       socket.join(roomId)
       partner.socket.join(roomId)
-
-      userSessions.set(socket.id, {
-        ...userSessions.get(socket.id),
-        room: roomId,
-        partnerId: partner.socketId
-      })
-      userSessions.set(partner.socketId, {
-        ...userSessions.get(partner.socketId),
-        room: roomId,
-        partnerId: socket.id
-      })
-
+      userSessions.set(socket.id, { ...userSessions.get(socket.id), room: roomId, partnerId: partner.socketId })
+      userSessions.set(partner.socketId, { ...userSessions.get(partner.socketId), room: roomId, partnerId: socket.id })
       activeRooms.set(roomId, [socket.id, partner.socketId])
-      socket.emit('match_found', { roomId, initiator: true })
-      partner.socket.emit('match_found', { roomId, initiator: false })
+      socket.emit('match_found', { roomId, initiator: true, partnerGender: partner.gender })
+      partner.socket.emit('match_found', { roomId, initiator: false, partnerGender: gender })
     } else {
-      waitingPool.push({ socketId: socket.id, socket })
+      waitingPool.push({ socketId: socket.id, socket, gender, pref })
       socket.emit('waiting')
     }
   })
 
-  // ── 4. Report User ───────────────────────────────────────
   socket.on('report_user', ({ reportedId, reason }) => {
     console.log(`🚨 Report: ${socket.id} reported ${reportedId} for: ${reason}`)
-    // In production: save to DB and auto-ban after threshold
     socket.emit('report_received', { message: 'Report submitted. Thank you.' })
   })
 
-  // ── 5. Disconnect ────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log(`❌ Disconnected: ${socket.id}`)
-
-    // Remove from waiting pool
-    waitingPool = waitingPool.filter((u) => u.socketId !== socket.id)
-
-    // Notify partner
+    waitingPool = waitingPool.filter(u => u.socketId !== socket.id)
     leaveRoom(socket)
-
     userSessions.delete(socket.id)
   })
 
-  // ── Helper: Leave current room ───────────────────────────
   const leaveRoom = (socket) => {
     const session = userSessions.get(socket.id)
     if (!session || !session.room) return
-
     const { room, partnerId } = session
-
-    // Notify partner
     if (partnerId) {
       io.to(partnerId).emit('partner_left')
-      // Reset partner session
-      const partnerSession = userSessions.get(partnerId)
-      if (partnerSession) {
-        userSessions.set(partnerId, {
-          ...partnerSession,
-          room: null,
-          partnerId: null
-        })
-      }
+      const ps = userSessions.get(partnerId)
+      if (ps) userSessions.set(partnerId, { ...ps, room: null, partnerId: null })
     }
-
     socket.leave(room)
     activeRooms.delete(room)
-
-    userSessions.set(socket.id, {
-      ...session,
-      room: null,
-      partnerId: null
-    })
+    userSessions.set(socket.id, { ...session, room: null, partnerId: null })
   }
 })
 
-// ── Health check endpoint ──────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    activeRooms: activeRooms.size,
-    waitingUsers: waitingPool.length,
-    totalConnected: io.engine.clientsCount
-  })
+  res.json({ status: 'running', activeRooms: activeRooms.size, waitingUsers: waitingPool.length, totalConnected: io.engine.clientsCount })
 })
 
-// ── Start server ───────────────────────────────────────────
 const PORT = process.env.PORT || 3000
-server.listen(PORT, () => {
-  console.log(`🚀 Signaling server running on port ${PORT}`)
-})
+server.listen(PORT, () => { console.log(`🚀 Server running on port ${PORT}`) })
