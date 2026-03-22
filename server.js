@@ -22,6 +22,7 @@ const ALLOWED_ORIGINS = [
   'http://localhost',
   'http://localhost:8081',
   'http://localhost:3000',
+  'https://randomchat-server-production.up.railway.app',
 ]
 
 const server = http.createServer(app)
