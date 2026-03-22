@@ -8,6 +8,7 @@ require('dotenv').config()
 const app = express()
 app.use(cors())
 app.use(express.json())
+app.set('trust proxy', 1)
 
 app.use(rateLimit({
   windowMs: 60 * 1000,
