@@ -194,7 +194,17 @@ io.on('connection', (socket) => {
     }
   })
 
-  // ── 4. Report with auto-ban ────────────────────────────
+  // ── 4. Chat ────────────────────────────────────────────
+  socket.on('chat_message', ({ roomId, message }) => {
+    if (!checkRate()) return
+    const session = userSessions.get(socket.id)
+    if (session?.room !== roomId) return
+    const safeMsg = String(message || '').slice(0, 200)
+    if (!safeMsg) return
+    socket.to(roomId).emit('chat_message', { message: safeMsg })
+  })
+
+  // ── 5. Report with auto-ban ────────────────────────────
   socket.on('report_user', ({ reportedId, reason }) => {
     if (!checkRate()) return
     const safeReason = String(reason || '').slice(0, 200)
