@@ -23,7 +23,9 @@ const ALLOWED_ORIGINS = [
   'http://localhost',
   'http://localhost:8081',
   'http://localhost:3000',
+  'http://localhost:5173',       // Vite dev server
   'https://randomchat-server-production.up.railway.app',
+  'https://voidcall-web.vercel.app',
 ]
 
 const server = http.createServer(app)
